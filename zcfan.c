@@ -5,6 +5,7 @@
 #include <limits.h>
 #include <signal.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -26,6 +27,7 @@
 #define info(fmt, ...) fprintf(stderr, "[INF] " fmt, ##__VA_ARGS__)
 #define err(fmt, ...) fprintf(stderr, "[ERR] " fmt, ##__VA_ARGS__)
 #define max(x, y) ((x) > (y) ? (x) : (y))
+#define min(x, y) ((x) < (y) ? (x) : (y))
 #define expect(x)                                                              \
     do {                                                                       \
         if (!(x)) {                                                            \
@@ -43,6 +45,11 @@
 static char ignored_sensors_arr[MAX_IGNORED_SENSORS][SENSOR_NAME_MAX];
 static size_t num_to_ignore_sensors = 0;
 static size_t num_ignored_sensors = 0;
+
+#define TEMP_FILTER_MAX_SIZE 5U
+static size_t temp_history_idx = 0;
+static size_t temp_history_count = 0;
+static int temp_filter_size = TEMP_FILTER_MAX_SIZE;
 
 #define MAX_SENSOR_FDS 4096
 static int sensor_fds[MAX_SENSOR_FDS];
@@ -225,6 +232,25 @@ static int read_temp_fd(int fd) {
     return (sscanf(buf, "%d", &val) == 1) ? val : TEMP_INVALID;
 }
 
+static inline size_t get_filter_size(void) {
+    return min(max((size_t)temp_filter_size, 1), TEMP_FILTER_MAX_SIZE);
+}
+
+static int mean_temp(int new_temp) {
+    static int temp_history[TEMP_FILTER_MAX_SIZE];
+    const size_t filter_size = get_filter_size();
+
+    temp_history[temp_history_idx] = new_temp;
+    temp_history_idx = (temp_history_idx + 1) % filter_size;
+    if (temp_history_count < filter_size)
+        temp_history_count++;
+
+    long sum = 0;
+    for (size_t i = 0; i < temp_history_count; i++)
+        sum += temp_history[i];
+    return (int)(sum / (long)temp_history_count);
+}
+
 static int get_max_temp(void) {
     int max_temp = TEMP_INVALID;
     for (size_t i = 0; i < num_sensor_fds; i++) {
@@ -238,7 +264,7 @@ static int get_max_temp(void) {
         return TEMP_INVALID;
     }
 
-    return MILLIC_TO_C(max_temp);
+    return mean_temp(MILLIC_TO_C(max_temp));
 }
 
 #define write_fan_level(level) write_fan("level", level)
@@ -336,6 +362,9 @@ static void maybe_ping_watchdog(void) {
         // revert to "auto".
         info("Clock jump detected, possible resume. Rewriting fan level\n");
         write_fan_level(current_rule->tpacpi_level);
+        /* Reset filter so stale temps don't linger after resume */
+        temp_history_idx = 0;
+        temp_history_count = 0;
     }
 
     if (now.tv_sec - last_watchdog_ping.tv_sec <
@@ -391,6 +420,7 @@ static void get_config(void) {
         fscanf_int_for_key(f, pos, "low_temp", rules[FAN_LOW].threshold);
         fscanf_int_for_key(f, pos, "watchdog_secs", watchdog_secs);
         fscanf_int_for_key(f, pos, "temp_hysteresis", temp_hysteresis);
+        fscanf_int_for_key(f, pos, "filter_size", temp_filter_size);
         fscanf_str_for_key(f, pos, "max_level", rules[FAN_MAX].tpacpi_level);
         fscanf_str_for_key(f, pos, "med_level", rules[FAN_MED].tpacpi_level);
         fscanf_str_for_key(f, pos, "low_level", rules[FAN_LOW].tpacpi_level);
@@ -419,6 +449,7 @@ static void print_thresholds(void) {
     }
     printf("[CFG] Ignored %zu present sensors based on config\n",
            num_ignored_sensors);
+    printf("[CFG] filter_size %ld\n", get_filter_size());
 }
 
 static void stop(int sig) {
